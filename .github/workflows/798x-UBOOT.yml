@@ -2,8 +2,8 @@ name: 798x-UBOOT
 
 on:
   #自动编译：每周日早上4点
-  schedule:
-    - cron: 0 20 * * 0
+  #schedule:
+    #- cron: 0 20 * * 0
   #手动编译
   workflow_dispatch:
 
@@ -17,7 +17,7 @@ permissions: write-all
 
 jobs:
   cleanup:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     steps:
       - name: Delete old Releases and Workflows
         uses: ophub/delete-releases-workflows@main
@@ -36,37 +36,18 @@ jobs:
       fail-fast: false
       #max-parallel: 4
       matrix:
-        WRT_ATF: [atf-20220606-637ba581b, atf-20231013-0ea67d76a]
-        WRT_MTK: [uboot-mtk-20220606, uboot-mtk-20230718-09eda825]
+        WRT_ATF: [atf-20220606-637ba581b, atf-20240117-bacca82a8, atf-20250711]
+        WRT_MTK: [uboot-mtk-20220606, uboot-mtk-20230718-09eda825, uboot-mtk-20250711]
 
     steps:
       - name: Checkout Projects
         uses: actions/checkout@main
 
-      - name: Free Disk Space
-        uses: endersonmenezes/free-disk-space@main
-        with:
-          remove_android: true
-          remove_dotnet: true
-          remove_haskell: true
-          remove_tool_cache: true
-          remove_swap: true
-          remove_packages: "android* azure* clang* dotnet* firefox* ghc* golang* google* libclang* libgl1* lld* llvm* \
-            microsoft* mongodb* mono* mysql* nodejs* openjdk* php* postgresql* powershell* snap* temurin* yarn* zulu*"
-          remove_packages_one_command: true
-          remove_folders: "/etc/apt/sources.list.d* /etc/mono* /etc/mysql* /usr/include/linux/android* /usr/lib/llvm* /usr/lib/mono* \
-            /usr/local/lib/android* /usr/local/lib/node_modules* /usr/local/share/chromium* /usr/local/share/powershell* \
-            /usr/local/share/vcpkg/ports/azure* /usr/local/share/vcpkg/ports/google* /usr/local/share/vcpkg/ports/libpq/android* \
-            /usr/local/share/vcpkg/ports/llvm* /usr/local/share/vcpkg/ports/mysql* /usr/local/share/vcpkg/ports/snap* \
-            /usr/share/azure* /usr/share/dotnet* /usr/share/glade* /usr/share/miniconda* /usr/share/php* /usr/share/swift \
-            /var/lib/mysql* /var/log/azure*"
-          testing: false
-
       - name: Initialization Environment
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
-          docker rmi $(docker images -q)
+          sudo -E apt -yqq purge firefox
           sudo -E apt -yqq update
           sudo -E apt -yqq full-upgrade
           sudo -E apt -yqq autoremove --purge
@@ -76,34 +57,60 @@ jobs:
           sudo -E systemctl daemon-reload
           sudo -E timedatectl set-timezone "Asia/Shanghai"
 
+          sudo mkdir -p /mnt/build_wrt
+          sudo chown $USER:$USER /mnt/build_wrt
+          sudo ln -s /mnt/build_wrt $GITHUB_WORKSPACE/wrt
+
       - name: Initialization Values
         run: |
-          export WRT_AUTHOR=$(echo $WRT_REPO | cut -d '/' -f 4)
-          export WRT_DATE=$(TZ=UTC-8 date +"%y.%m.%d")
-          export WRT_VER=$(echo ${{matrix.WRT_ATF}} | grep -oP 'atf-\d+')_$(echo ${{matrix.WRT_MTK}} | grep -oP 'mtk-\d+')
-          export WRT_MULTI_TYPE=$(sed -n "2{s/^#//;s/\r$//;p;q}" $GITHUB_WORKSPACE/Uboots.sh)
-          export WRT_SINGLE_TYPE=$(sed -n "1{s/^#//;s/\r$//;p;q}" $GITHUB_WORKSPACE/Uboots.sh)
-
-          echo "WRT_AUTHOR=$WRT_AUTHOR" >> $GITHUB_ENV
-          echo "WRT_DATE=$WRT_DATE" >> $GITHUB_ENV
-          echo "WRT_VER=$WRT_VER" >> $GITHUB_ENV
-          echo "WRT_MULTI_TYPE=$WRT_MULTI_TYPE" >> $GITHUB_ENV
-          echo "WRT_SINGLE_TYPE=$WRT_SINGLE_TYPE" >> $GITHUB_ENV
+          echo "WRT_AUTHOR=$(echo $WRT_REPO | cut -d '/' -f 4)" >> $GITHUB_ENV
+          echo "WRT_DATE=$(TZ=UTC-8 date +"%y.%m.%d")" >> $GITHUB_ENV
+          echo "WRT_VER=$(echo ${{matrix.WRT_ATF}} | grep -oP 'atf-\d+')_$(echo ${{matrix.WRT_MTK}} | grep -oP 'mtk-\d+')" >> $GITHUB_ENV
 
       - name: Clone Code
         run: |
           git clone --depth=1 --single-branch --branch $WRT_BRANCH $WRT_REPO ./wrt/
 
-      - name: Check Scripts
+      - name: Compile Prepare
         run: |
+          sed -i "5s/UBOOT_DIR=.*/UBOOT_DIR=${{matrix.WRT_MTK}}/" ./wrt/build.sh
+          sed -i "7s/ATF_DIR=.*/ATF_DIR=${{matrix.WRT_ATF}}/" ./wrt/build.sh
+
+          # 收集 uboot 配置并生成 Uboots.txt
+          declare -A lines_map
+          while IFS= read -r f; do
+            [[ $(basename "$f") =~ ^(mt798[16])_(.*)_defconfig$ ]] || continue
+            soc="${BASH_REMATCH[1]}"
+            rest="${BASH_REMATCH[2]}"
+            board="${rest%_multi_layout}"
+
+            key="$soc:$board"
+            if [[ $rest == *_multi_layout ]]; then
+              lines_map["$key"]="SOC=$soc BOARD=$board MULTI_LAYOUT=1 ./build.sh"
+            elif [[ -z "${lines_map[$key]}" ]]; then
+              lines_map["$key"]="SOC=$soc BOARD=$board ./build.sh"
+            fi
+          done < <(find ./wrt/uboot-mtk-*/configs -type f -name 'mt798*defconfig' | grep -iE 'mt798[16]_' | grep -ivE 'rfb|fpga')
+
+          # 输出 Uboots.txt
+          printf "%s\n" "${lines_map[@]}" | sort > ./Uboots.txt
+
+          # 生成 TYPE_7981 和 TYPE_7986（按 SOC 分类，BOARD 大写 + 排序）
+          for soc in 7981 7986; do
+            boards=$(awk -v s="SOC=mt$soc" '$0 ~ s {
+              for (i=1; i<=NF; i++) if ($i ~ /^BOARD=/) {
+                split($i, a, "="); print toupper(a[2]);
+              }
+            }' ./Uboots.txt | sort -u | xargs)
+            eval "TYPE_$soc=\"$boards\""
+          done
+
+          # 检查权限
+          mv -f Uboots.txt Uboots.sh
           find ./ -maxdepth 3 -type f -iregex ".*\(txt\|sh\)$" -exec dos2unix {} \; -exec chmod +x {} \;
 
-      - name: Modified Version
-        run: |
-          cd ./wrt/
-
-          sed -i "5s/UBOOT_DIR=.*/UBOOT_DIR=${{matrix.WRT_MTK}}/" ./build.sh
-          sed -i "7s/ATF_DIR=.*/ATF_DIR=${{matrix.WRT_ATF}}/" ./build.sh
+          echo "WRT_TYPE_7981=$TYPE_7981" >> $GITHUB_ENV
+          echo "WRT_TYPE_7986=$TYPE_7986" >> $GITHUB_ENV
 
       - name: Compile Firmware
         run: |
@@ -148,7 +155,10 @@ jobs:
 
             平台：${{env.WRT_TARGET}}
             源码：${{env.WRT_REPO}}
+            分支：${{env.WRT_BRANCH}}
+
             ATF版本：${{matrix.WRT_ATF}}
             MTK版本：${{matrix.WRT_MTK}}
-            单分区设备：${{env.WRT_SINGLE_TYPE}}
-            多分区设备：${{env.WRT_MULTI_TYPE}}
+
+            7981设备：${{env.WRT_TYPE_7981}}
+            7986设备：${{env.WRT_TYPE_7986}}
